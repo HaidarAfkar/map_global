@@ -10,6 +10,8 @@ from sklearn.cluster import KMeans
 import osmnx as ox
 import numpy as np
 import uvicorn
+from shapely.geometry import LineString
+from shapely.wkb import loads as load_wkb
 
 app = FastAPI(title="FAT Auto Placement Service")
 
@@ -32,6 +34,14 @@ CSV_FALLBACK_PATH = os.getenv(
 )
 ENABLE_ROAD_SNAP = os.getenv("ENABLE_ROAD_SNAP", "false").lower() in {"1", "true", "yes", "on"}
 ROAD_SNAP_TIMEOUT = int(os.getenv("ROAD_SNAP_TIMEOUT", "15"))
+ENABLE_OBSTACLE_AWARE = os.getenv("ENABLE_OBSTACLE_AWARE", "true").lower() in {"1", "true", "yes", "on"}
+OBSTACLE_TABLE = os.getenv("OSM_OBSTACLE_TABLE", "osm_palembang_obstacles")
+OBSTACLE_PENALTIES = {
+    "water": float(os.getenv("OBSTACLE_WATER_PENALTY_M", "1000")),
+    "rail": float(os.getenv("OBSTACLE_RAIL_PENALTY_M", "500")),
+    "major_road": float(os.getenv("OBSTACLE_MAJOR_ROAD_PENALTY_M", "250")),
+    "other": float(os.getenv("OBSTACLE_OTHER_PENALTY_M", "100")),
+}
 _CSV_BUILDINGS_CACHE = None
 
 # ==========================================
@@ -138,6 +148,52 @@ def fetch_buildings(bbox: Bbox):
             detail="Database connection error and CSV fallback returned no buildings.",
         )
 
+def fetch_obstacles(bbox: Bbox):
+    """Fetch local OSM obstacles from PostGIS for the requested bbox."""
+    if not ENABLE_OBSTACLE_AWARE:
+        return []
+
+    lat_min, lat_max, lon_min, lon_max = normalize_bbox(bbox)
+    query = f"""
+        SELECT
+            id,
+            obstacle_type,
+            COALESCE(name, '') AS name,
+            ST_AsBinary(geom) AS geom_wkb
+        FROM {OBSTACLE_TABLE}
+        WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+          AND ST_Intersects(geom, ST_MakeEnvelope(%s, %s, %s, %s, 4326))
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                params = (lon_min, lat_min, lon_max, lat_max) * 2
+                cur.execute(query, params)
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"Warning: obstacle query skipped: {e}")
+        return []
+
+    obstacles = []
+    for row in rows:
+        try:
+            geom = load_wkb(bytes(row["geom_wkb"]))
+        except Exception:
+            continue
+        if geom.is_empty:
+            continue
+        obstacle_type = row["obstacle_type"] or "other"
+        obstacles.append({
+            "id": row["id"],
+            "type": obstacle_type,
+            "name": row["name"],
+            "geometry": geom,
+            "penalty_m": OBSTACLE_PENALTIES.get(obstacle_type, OBSTACLE_PENALTIES["other"]),
+        })
+
+    print(f"Fetched {len(obstacles)} local OSM obstacles.")
+    return obstacles
+
 def snap_centroids_to_roads(centroids, bbox: Bbox):
     """Snap all centroids using one OSMnx graph request; fallback to centroids if disabled/fails."""
     if not ENABLE_ROAD_SNAP:
@@ -149,7 +205,7 @@ def snap_centroids_to_roads(centroids, bbox: Bbox):
 
         lat_min, lat_max, lon_min, lon_max = normalize_bbox(bbox)
         pad = 0.002
-        graph_bbox = (lat_max + pad, lat_min - pad, lon_max + pad, lon_min - pad)
+        graph_bbox = (lon_min - pad, lat_min - pad, lon_max + pad, lat_max + pad)
         graph = ox.graph_from_bbox(graph_bbox, network_type="drive")
         node_ids = ox.distance.nearest_nodes(
             graph,
@@ -179,6 +235,77 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     
     return R * c
 
+def evaluate_connection(building_lat, building_lon, fat_lat, fat_lon, obstacles):
+    """Calculate straight distance plus obstacle crossing penalties."""
+    straight_distance = calculate_distance(building_lat, building_lon, fat_lat, fat_lon)
+    if not obstacles:
+        return {
+            "straight_distance_m": straight_distance,
+            "obstacle_penalty_m": 0.0,
+            "adjusted_distance_m": straight_distance,
+            "crossed_obstacles": [],
+        }
+
+    line = LineString([(float(building_lon), float(building_lat)), (float(fat_lon), float(fat_lat))])
+    crossed = []
+    penalty = 0.0
+    for obstacle in obstacles:
+        try:
+            if not line.crosses(obstacle["geometry"]) and not line.intersects(obstacle["geometry"]):
+                continue
+        except Exception:
+            continue
+
+        penalty += obstacle["penalty_m"]
+        crossed.append({
+            "id": obstacle["id"],
+            "type": obstacle["type"],
+            "name": obstacle["name"],
+            "penalty_m": round(obstacle["penalty_m"], 2),
+        })
+
+    return {
+        "straight_distance_m": straight_distance,
+        "obstacle_penalty_m": penalty,
+        "adjusted_distance_m": straight_distance + penalty,
+        "crossed_obstacles": crossed,
+    }
+
+def assign_buildings_to_fats(coords, building_ids, fat_points, capacity_per_fat, obstacles):
+    """Assign buildings to FATs using distance plus obstacle penalties."""
+    if not obstacles:
+        assignments = {}
+        for fat_index in range(len(fat_points)):
+            assignments[fat_index] = []
+        return assignments, {}
+
+    assignments = {fat_index: [] for fat_index in range(len(fat_points))}
+    metrics_by_pair = {}
+
+    for building_index, (building_lat, building_lon) in enumerate(coords):
+        candidates = []
+        for fat_index, (fat_lat, fat_lon, _) in enumerate(fat_points):
+            metrics = evaluate_connection(
+                building_lat,
+                building_lon,
+                fat_lat,
+                fat_lon,
+                obstacles,
+            )
+            metrics_by_pair[(building_index, fat_index)] = metrics
+            candidates.append((metrics["adjusted_distance_m"], fat_index))
+
+        candidates.sort(key=lambda item: item[0])
+        selected_fat = candidates[0][1]
+        for _, fat_index in candidates:
+            if len(assignments[fat_index]) < capacity_per_fat:
+                selected_fat = fat_index
+                break
+
+        assignments[selected_fat].append(building_index)
+
+    return assignments, metrics_by_pair
+
 # ==========================================
 # Main Endpoint
 # ==========================================
@@ -193,6 +320,7 @@ def generate_fat(request: GenerateFatRequest):
     buildings = fetch_buildings(request.bbox)
     if not buildings:
         raise HTTPException(status_code=404, detail="No buildings found in this bounding box.")
+    obstacles = fetch_obstacles(request.bbox)
     
     print(f"Found {len(buildings)} buildings.")
     
@@ -212,14 +340,23 @@ def generate_fat(request: GenerateFatRequest):
     labels = kmeans.labels_
     centroids = kmeans.cluster_centers_
     snapped_centroids = snap_centroids_to_roads(centroids, request.bbox)
+    assignments, metrics_by_pair = assign_buildings_to_fats(
+        coords,
+        building_ids,
+        snapped_centroids,
+        request.capacity_per_fat,
+        obstacles,
+    )
     
     # 3. Build Result
     fats = []
     connections = []
     
     for cluster_id in range(n_clusters):
-        # Find which buildings belong to this cluster
-        cluster_b_indices = np.where(labels == cluster_id)[0]
+        if obstacles:
+            cluster_b_indices = np.array(assignments[cluster_id], dtype=int)
+        else:
+            cluster_b_indices = np.where(labels == cluster_id)[0]
         cluster_building_ids = [building_ids[i] for i in cluster_b_indices]
         
         road_lat, road_lon, snapped_to_road = snapped_centroids[cluster_id]
@@ -240,12 +377,24 @@ def generate_fat(request: GenerateFatRequest):
         for idx in cluster_b_indices:
             b_lat = coords[idx][0]
             b_lon = coords[idx][1]
-            dist = calculate_distance(b_lat, b_lon, road_lat, road_lon)
+            metrics = metrics_by_pair.get((idx, cluster_id))
+            if metrics is None:
+                metrics = evaluate_connection(b_lat, b_lon, road_lat, road_lon, obstacles)
             
             connections.append({
                 "building_id": building_ids[idx],
                 "fat_id": fat_id,
-                "distance": round(dist, 2) # in meters
+                "building_latitude": float(b_lat),
+                "building_longitude": float(b_lon),
+                "fat_latitude": float(road_lat),
+                "fat_longitude": float(road_lon),
+                "distance": round(metrics["adjusted_distance_m"], 2),
+                "distance_m": round(metrics["adjusted_distance_m"], 2),
+                "straight_distance_m": round(metrics["straight_distance_m"], 2),
+                "obstacle_penalty_m": round(metrics["obstacle_penalty_m"], 2),
+                "adjusted_distance_m": round(metrics["adjusted_distance_m"], 2),
+                "network_distance_m": None,
+                "crossed_obstacles": metrics["crossed_obstacles"],
             })
             
     return {
@@ -256,6 +405,14 @@ def generate_fat(request: GenerateFatRequest):
             "fat_count": n_clusters,
             "capacity_per_fat": request.capacity_per_fat,
             "road_snap_enabled": ENABLE_ROAD_SNAP,
+            "obstacle_aware_enabled": ENABLE_OBSTACLE_AWARE,
+            "obstacle_count": len(obstacles),
+            "routing_mode": "straight_line_with_obstacle_penalty",
+            "levels_applied": {
+                "level_1_crossing_penalty": bool(obstacles),
+                "level_2_obstacle_aware_reassignment": bool(obstacles),
+                "level_3_local_road_routing": False,
+            },
         },
     }
 
